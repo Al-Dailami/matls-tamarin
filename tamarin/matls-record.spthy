@@ -1,0 +1,483 @@
+/*
+   Author: Zach Smith
+   Model Name: 
+   Status: DEVELOPMENTAL
+
+    Simple maTLS record phase protocol.
+    This handles a single message-response on a channel.
+    Modification is handled only on the return trip for ease of modelling
+    
+        - Pairs of agents in the path symmetric keys
+        - The content of the message is readable by all intermediate agents
+        - Each intermediate agent decrypts using one shared symmetric key, re-encrypts with another
+
+  We make the following assumptions
+
+        - The handshake proceeded honestly 
+            - We allow for corruption after the fact
+            - The security claims within the handshake make this a safe assumption (by compositional security)
+        - mac+senc is condensed to senc
+        - A single middlebox can only appear once on each path
+
+*/
+
+theory matls_record
+
+begin
+
+builtins: symmetric-encryption
+functions: keyedHash/2, hash/1
+
+// ------------------------- Path Creation -------------------- //
+/* These rules handle the establishment of a path. They act as a short-form of the
+   handshake protocol. Intuitively, we want to show that the path chosen here will
+   inevitably be the one that is used later
+*/
+
+// Initializes the client and adds a single middlebox
+// Initiate looping lemmas
+rule CreateClient:
+    [
+      // Encryption keys
+      Fr(~k_acc_cs), // Will be used to define the path
+      Fr(~k_acc_cm),
+      Fr(~k_acc_ms), 
+      Fr(~k_tls_cm)
+    ]
+  --[
+      // Restrictions
+      IsClient($A),
+      IsMiddlebox($M),
+      IsServer($S),
+      UniqueOnPath($M, ~k_acc_cs),
+      BindKeyToPath(~k_tls_cm, ~k_acc_cs),
+      Bounded('add'),
+      // Looping Helper Lemma
+      LoopSource(~k_acc_cs),
+      // Path Integrity Ordering
+      PathOrder($C, $M, ~k_acc_cs)
+    ]->
+    [
+      // Key registration
+      !ClientSession($C, $M, $S, ~k_acc_cs, ~k_tls_cm), // Adjacent session (TLS)
+      MiddleboxHalfSession($C, $M, 'empty', ~k_acc_cs, ~k_acc_cm, ~k_acc_ms, ~k_tls_cm, 'empty')
+    ]
+
+// Add a middlebox to the client's path
+rule AddMiddlebox:
+    [
+      MiddleboxHalfSession(Last, $Current, 'empty', pathID, k_acc_cm1, k_acc_m1s, k_tls_last, 'empty'),
+      Fr(~k_acc_m2s),
+      Fr(~k_tls_next),
+      Fr(~k_acc_cm2)
+    ]
+  --[
+      // Restrictions
+      IsMiddlebox($Next),
+      UniqueOnPath($Next, pathID),
+      BindKeyToPath(~k_tls_next, pathID),
+      Bounded('add'),
+      // Looping
+      LoopStep(pathID),
+      // Path Integrity
+      PathOrder($Current, $Next, pathID)
+    ]->
+    [
+      !MiddleboxSession(Last, $Current, $Next, pathID, k_acc_cm1, k_acc_m1s, k_tls_last, ~k_tls_next),
+      !ClientAccountabilityKey($Current, pathID, k_acc_cm1),
+      !ServerAccountabiltyKey($Current, pathID, k_acc_m1s),
+      MiddleboxHalfSession($Current, $Next, 'empty', pathID, ~k_acc_cm2, ~k_acc_m2s, ~k_tls_next, 'empty')
+    ]
+
+// Add a corrupt middlebox (i.e. the adversary also learns the keys)
+rule AddCorruptMiddlebox:
+    [
+      MiddleboxHalfSession(Last, $Current, 'empty', pathID, k_acc_cm1, k_acc_m1s, k_tls_last, 'empty'),
+      Fr(~k_acc_m2s),
+      Fr(~k_tls_next),
+      Fr(~k_acc_cm2)
+    ]
+  --[
+      // Restrictions
+      IsMiddlebox($Next),
+      UniqueOnPath($Next, pathID),
+      BindKeyToPath(~k_tls_next, pathID),
+      Bounded('add'),
+      CorruptMiddlebox($Current, ~k_tls_next, pathID),
+      CorruptMiddlebox($Current, k_tls_last, pathID),
+      CorruptMiddleboxAccKey($Current, k_acc_cm1, pathID),
+      CorruptMiddleboxAccKey($Current, k_acc_m1s, pathID),
+      // Looping
+      LoopStep(pathID),
+      // Path Integrity
+      PathOrder($Current, $Next, pathID)
+    ]->
+    [
+      !MiddleboxSession(Last, $Current, $Next, pathID, k_acc_cm1, k_acc_m1s, k_tls_last, ~k_tls_next),
+      !ClientAccountabilityKey($Current, pathID, k_acc_cm1),
+      !ServerAccountabiltyKey($Current, pathID, k_acc_m1s),
+      MiddleboxHalfSession($Current, $Next, 'empty', pathID, ~k_acc_cm2, ~k_acc_m2s, ~k_tls_next, 'empty')
+    ]
+
+// End a path by declaring the server
+rule EndPath:
+    [
+      MiddleboxHalfSession(Last, $Current, 'empty', pathID, k_acc_cm1, k_acc_m1s, k_tls_last, 'empty'),
+      Fr(~k_tls_next)
+    ]
+  --[ 
+      // Restrictions
+      IsServer($S),
+      UniqueOnPath($S, pathID),
+      SessionEstablished(pathID),
+      BindKeyToPath(~k_tls_next, pathID),
+      Bounded('add'),
+      // Looping lemma
+      LoopClose(pathID)
+    ]->
+    [
+      !MiddleboxSession(Last, $Current, $S, pathID, k_acc_cm1, k_acc_m1s, k_tls_last, ~k_tls_next),
+      !ClientAccountabilityKey($Current, pathID, k_acc_cm1),
+      !ServerAccountabiltyKey($Current, pathID, k_acc_m1s),
+      !ServerSession($C, $Current, $S, pathID, ~k_tls_next)
+    ]
+
+// ------------------------- Forward Path Operation -------------------- //
+/* 
+    The sending of messages, i.e. the main protocol rules.
+*/
+
+// Client sends a message. For this message, the pathID is precisely the accountability key
+rule CreateRequest:
+  let
+    hashChain = keyedHash(hash(~request), pathID)
+    outMsg = <'request', ~request, hashChain>
+    outSenc = senc(outMsg, k_tls_cm)
+  in
+  [
+    !ClientSession($C, $M, $S, pathID, k_tls_cm),
+    Fr(~request)
+  ]
+--[
+    // Restrictions
+    RequireEstablishedSession(pathID),
+    SendUsingKey(k_tls_cm, pathID),
+    Bounded('req'),
+    // Sources
+    SentEncryptedUsing($C, outMsg, outSenc),    
+    // Looping
+    RequestSource(pathID, k_tls_cm, outMsg)
+  ]->
+  [
+    Out(outSenc),
+    ClientRequest(pathID, ~request)
+  ]
+
+// Middlebox forwards a request
+rule ForwardRequest:
+  let
+    inMsg = <'request', request, inHashChain>
+    inSenc = senc(inMsg, k_tls_cm1)
+    outHashChain = keyedHash(inHashChain, k_acc_m1s)
+    outMsg = <'request', request, outHashChain>
+    outSenc = senc(outMsg, k_tls_m1m2)
+  in
+  [
+    In(inSenc),
+    !MiddleboxSession(Last, $M1, $M2, pathID, k_acc_cm1, k_acc_m1s, k_tls_cm1, k_tls_m1m2)
+  ]
+--[
+    // Restrictions
+    RequireEstablishedSession(pathID),
+    RecvUsingKey(k_tls_cm1, pathID),
+    SendUsingKey(k_tls_m1m2, pathID),
+    Bounded('req'),
+    UseAccKeyOnPath(k_acc_m1s, pathID),
+    // Sources
+    ReceivesEncryptedUsing($M1, inMsg, inSenc),
+    SentEncryptedUsing($M1, outMsg, outSenc),
+    // Looping
+    RequestLoop(pathID, k_tls_cm1, inMsg)
+  ]->
+  [
+    Out(outSenc)
+  ]
+
+// Server receives a request
+// (they can unwrap it later)
+rule ReceiveRequest:
+  let
+    inMsg = <'request', request, hashChain>
+    inSenc = senc(inMsg, k_tls_ms)
+  in
+  [
+    In(inSenc),
+    !ServerSession($C, $Current, $S, pathID, k_tls_ms)
+  ]
+--[
+    // Restrictions
+    RequireEstablishedSession(pathID),
+    RecvUsingKey(k_tls_ms, pathID),
+    Bounded('req'),
+    // Sources
+    ReceivesEncryptedUsing($S, inMsg, inSenc),
+    // Looping
+    RequestRecv(pathID)
+  ]->
+  [
+    ServerReceivesMessage($C, $Current, $S, pathID, request, hashChain)
+  ]
+
+rule ServerReply:
+  let
+    hashChain = keyedHash(hash(~response), pathID)
+    outMsg = <'reply', ~response, hashChain>
+    outSenc = senc(outMsg, k_tls_ms)
+  in
+  [
+    Fr(~response),
+    ServerReceivesMessage($C, $Current, $S, pathID, request, oldHashChain),
+    !ServerSession($C, $Current, $S, pathID, k_tls_ms)
+  ]
+--[
+    // Restrictions
+    RequireEstablishedSession(pathID),
+    SendUsingKey(k_tls_ms, pathID),
+    Bounded('resp'),
+    // Sources
+    SentEncryptedUsing($S, outMsg, outSenc),
+    // Looping
+    ReplySource(pathID)
+  ]->
+  [
+    Out(outSenc)
+  ]
+
+// Middlebox forwards reply without modification
+rule ForwardReply_NoEdit:
+  let
+    inMsg = <'reply', response, inHashChain>
+    inSenc = senc(inMsg, k_tls_m1m2)
+    outHashChain = keyedHash(response, k_acc_cm1)
+    outMsg = <'reply', response, outHashChain>
+    outSenc = senc(outMsg, k_tls_cm1)
+  in
+  [
+    !MiddleboxSession($M2, $M1, Last, pathID, k_acc_cm1, k_acc_m1s, k_tls_cm1, k_tls_m1m2),
+    In(inSenc)
+  ]
+--[
+    // Restrictions
+    RequireEstablishedSession(pathID),
+    AlreadyReplied($M1, response),
+    Bounded('resp'),
+    RecvUsingKey(k_tls_cm1, pathID),
+    SendUsingKey(k_tls_m1m2, pathID),
+    UseAccKeyOnPath(k_acc_cm1, pathID),
+    // Sources
+    ReceivesEncryptedUsing($M1, inMsg, inSenc),
+    SentEncryptedUsing($M1, outMsg, outSenc),
+    // Looping
+    ReplyLoop(pathID)
+  ]->
+  [
+    Out(outSenc)
+  ]
+
+rule ForwardReply_Edit:
+  let
+    inMsg = <'reply', response, inHashChain>
+    inSenc = senc(inMsg, k_tls_m1m2)
+    modificationLog = keyedHash(hash(<response, ~newResp>), k_acc_cm1) 
+    outHashChain = < inHashChain, $M1, modificationLog >
+    outMsg = <'reply', response, outHashChain>
+    outSenc = senc(outMsg, k_tls_cm1)
+  in
+  [
+    !MiddleboxSession($M2, $M1, Last, pathID, k_acc_cm1, k_acc_m1s, k_tls_cm1, k_tls_m1m2),
+    In(inSenc),
+    Fr(~newResp)
+  ]
+--[
+    // Restrictions
+    RequireEstablishedSession(pathID),
+    AlreadyReplied($M1, response),
+    Bounded('resp'),
+    SendUsingKey(k_tls_cm1, pathID),
+    RecvUsingKey(k_tls_m1m2, pathID),
+    UseAccKeyOnPath(k_acc_cm1, pathID),
+    // Sources
+    ReceivesEncryptedUsing($M1, inMsg, inSenc),
+    SentEncryptedUsing($M1, outMsg, outSenc),
+    // Looping
+    ReplyLoop(pathID)
+  ]->
+  [
+    Out(outSenc)
+  ]
+
+// Client receives a reply. We can unwrap it later
+rule ReceiveReply:
+  let
+    inMsg = <'reply', response, inHashChain>
+    inSenc = senc(inMsg, k_tls_cm1)
+  in
+  [
+    !ClientSession($C, $M, $S, pathID, k_tls_cm1),
+    In(inSenc),
+    ClientRequest(pathID, request)
+  ]
+--[
+    // Sources
+    ReceivesEncryptedUsing($C, inMsg, inSenc),
+    // Restrictions
+    Bounded('resp'),
+    RecvUsingKey(k_tls_cm1, pathID),
+    // Looping
+    ReplyRecv(pathID),
+    Reachable()
+    // Sanity lemma,
+  ]->
+  [
+    CheckReply(pathID, request, response, inHashChain)
+  ]
+
+// ------------------------- Restrictions --------------------- //
+
+// If someone is a client, they are not a middlebox or a server etc. 
+restriction unique_role:
+"
+    (All A #tc. IsClient(A)@tc ==> not Ex #tm. IsMiddlebox(A)@tm)
+  & (All A #tc. IsClient(A)@tc ==> not Ex #ts. IsServer(A)@ts)
+  & (All A #tm. IsMiddlebox(A)@tm ==> not Ex #tc. IsClient(A)@tc)
+  & (All A #tm. IsMiddlebox(A)@tm ==> not Ex #ts. IsServer(A)@ts)
+  & (All A #ts. IsServer(A)@ts ==> not Ex #tc. IsClient(A)@tc)
+  & (All A #ts. IsServer(A)@ts ==> not Ex #tm. IsMiddlebox(A)@tm)
+"
+
+// A given middlebox can only be on each path once
+restriction unique_on_path:
+"
+  All A pID #t1 #t2. UniqueOnPath(A, pID)@t1 & UniqueOnPath(A, pID)@t2
+    ==> (#t1 = #t2)
+"
+
+// We will only send requests down a path once it is established
+/*
+restriction require_established_session:
+"
+  All pID #tsend. RequireEstablishedSession(pID)@tsend
+==>
+  Ex #tfinish. SessionEstablished(pID)@tfinish
+"
+*/
+
+// A middlebox won't wilingly edit the same response twice (i.e. in a replay)
+restriction already_replied:
+"
+  All response agent #tresp1 #tresp2. AlreadyReplied(agent, response)@tresp1 &
+        AlreadyReplied(agent, response)@tresp2
+  ==> (#tresp1 = #tresp2)
+"
+
+// Bound the length of paths
+restriction bounded:
+"
+  All type #t1 #t2 #t3 #t4.
+    Bounded(type)@t1 & Bounded(type)@t2 & Bounded(type)@t3 & Bounded(type)@t4
+  ==>
+    (#t1 = #t2)|(#t1 = #t3)|(#t1 = #t4)|
+    (#t2 = #t3)|(#t2 = #t4)|
+    (#t3 = #t4)
+"
+
+// If an agent sends using a key, then either the value is secret or the sender is corrupt
+// Follows as keys cannot be derived from messages
+restriction send_tls_keys:
+"
+  All tlsKey pathID #tuse. SendUsingKey(tlsKey, pathID)@tuse
+==>
+  ((not Ex #tkk. KU(tlsKey)@tkk) &
+  (not Ex #tkp. KU(pathID)@tkp)
+  )
+"
+
+// If an agent receives using a key, then either the value is secret, they are corrupt,
+// or their predecessor is corrupt
+restriction recv_tls_keys:
+"
+  All tlsKey pathID #tuse. RecvUsingKey(tlsKey, pathID)@tuse
+==>
+  ((not Ex #tkk. KU(tlsKey)@tkk) &
+  (not Ex #tkp. KU(pathID)@tkp)
+  ) 
+"
+
+restriction unknown_acc_keys:
+"
+  All accKey pathID #tuse. UseAccKeyOnPath(accKey, pathID)@tuse
+==>
+  ((not Ex #tkk. KU(accKey)@tkk) &
+  (not Ex #tkp. KU(pathID)@tkp)
+  ) | (
+  Ex M #tcorrupt. CorruptMiddleboxAccKey(M, accKey, pathID)@tcorrupt
+  )
+"
+
+// --------------------------- Sources --------------------------- //
+
+restriction receives_encryption:
+"
+  All A payload fullMessage #tenc. ReceivesEncryptedUsing(A, payload, fullMessage)@tenc ==>
+    (Ex #tkv. K(payload)@tkv
+              & (#tkv < #tenc)
+    ) |
+    (Ex B #tsend. SentEncryptedUsing(B, payload, fullMessage)@tsend
+          & (#tsend < #tenc)
+    )
+"
+
+// ----------------------------- Looping ------------------------- //
+
+lemma PathCreationLoop[use_induction, reuse]:
+"
+  (All pID #tloop. LoopStep(pID)@tloop
+==>
+  Ex #tsource. LoopSource(pID)@tsource) &
+   (All pID #tclose. LoopClose(pID)@tclose
+==>
+  Ex #tsource. LoopSource(pID)@tsource)  
+"
+/*
+lemma RequestLoop[use_induction, reuse]:
+"
+  All pID key value #tloop. RequestLoop(pID, key, value)@tloop
+==>
+    (Ex key2 value2 #tsource. RequestSource(pID, key2, value2)@tsource)
+  | (Ex #tkk #tkv. K(value)@tkv & (#tkv < #tloop) &
+                   K(key)@tkk & K(value)@tkv
+    )
+//&   (All pID #tclose. RequestRecv(pID)@tclose
+//==>
+//  Ex #tsource. RequestSource(pID)@tsource)  
+"
+
+lemma ReplyLoop[use_induction, reuse]:
+"
+  (All pID #tloop. ReplyLoop(pID)@tloop
+==>
+  Ex #tsource. ReplySource(pID)@tsource) &
+   (All pID #tclose. ReplyRecv(pID)@tclose
+==>
+  Ex #tsource. ReplySource(pID)@tsource)  
+"
+*/
+// ------------------------- Reachability --------------------- //
+
+lemma reachable:
+  exists-trace
+"
+  Ex #t. Reachable()@t
+"
+
+end
