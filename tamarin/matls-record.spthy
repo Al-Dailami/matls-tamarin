@@ -90,6 +90,7 @@ rule AddMiddlebox:
     ]
 
 // Add a corrupt middlebox (i.e. the adversary also learns the keys)
+
 rule AddCorruptMiddlebox:
     [
       MiddleboxHalfSession(Last, $Current, 'empty', pathID, k_acc_cm1, k_acc_m1s, k_tls_last, 'empty'),
@@ -118,6 +119,7 @@ rule AddCorruptMiddlebox:
       !ServerAccountabiltyKey($Current, pathID, k_acc_m1s),
       MiddleboxHalfSession($Current, $Next, 'empty', pathID, ~k_acc_cm2, ~k_acc_m2s, ~k_tls_next, 'empty')
     ]
+
 
 // End a path by declaring the server
 rule EndPath:
@@ -230,7 +232,7 @@ rule ReceiveRequest:
 
 rule ServerReply:
   let
-    hashChain = keyedHash(hash(~response), pathID)
+    hashChain = keyedHash(hash(<'original', ~response>), pathID) // typeerrors
     outMsg = <'reply', ~response, hashChain>
     outSenc = senc(outMsg, k_tls_ms)
   in
@@ -254,11 +256,12 @@ rule ServerReply:
   ]
 
 // Middlebox forwards reply without modification
+// Just hash the old hashchain, don't worry about it
 rule ForwardReply_NoEdit:
   let
     inMsg = <'reply', response, inHashChain>
     inSenc = senc(inMsg, k_tls_m1m2)
-    outHashChain = keyedHash(response, k_acc_cm1)
+    outHashChain = keyedHash(<'nochange', inHashChain>, k_acc_cm1) // avoid obvious typeerrors
     outMsg = <'reply', response, outHashChain>
     outSenc = senc(outMsg, k_tls_cm1)
   in
@@ -288,9 +291,10 @@ rule ForwardReply_Edit:
   let
     inMsg = <'reply', response, inHashChain>
     inSenc = senc(inMsg, k_tls_m1m2)
-    modificationLog = keyedHash(hash(<response, ~newResp>), k_acc_cm1) 
-    outHashChain = < inHashChain, $M1, modificationLog >
-    outMsg = <'reply', response, outHashChain>
+    modificationLog = keyedHash(< 'change', hash(response), hash(~newResp) >, k_acc_cm1) 
+    // we're including the hash of the ~old~ response, so that the receiver can unwrap it later (they can read the new response directly)
+    outHashChain = < inHashChain, $M1, hash(response), modificationLog >
+    outMsg = <'reply', ~newResp, outHashChain>
     outSenc = senc(outMsg, k_tls_cm1)
   in
   [
@@ -334,13 +338,76 @@ rule ReceiveReply:
     Bounded('resp'),
     RecvUsingKey(k_tls_cm1, pathID),
     // Looping
-    ReplyRecv(pathID),
-    Reachable()
+    ReplyRecv(pathID)
+    //Reachable()
     // Sanity lemma,
   ]->
   [
     CheckReply(pathID, request, response, inHashChain)
   ]
+
+// Unwrap a step of the reply
+// Not the server, and no modification
+rule UnwrapReplyNoModification:
+  let
+    inHashChain = keyedHash(<'nochange', outHashChain>, k_acc_cm1)
+    newResponse = response // the message didn't change
+  in
+  [
+    CheckReply(pathID, request, response, inHashChain),
+    !ClientSession($C, $M, $S, pathID, k_tls_cm1),
+    !ClientAccountabilityKey($Current, pathID, k_acc_cm1)
+  ]
+--[
+    // Restrictions
+    Bounded('unwrap')
+  ]->
+  [
+    CheckReply(pathID, request, newResponse, outHashChain)
+  ]
+
+// Unwrap a step of the reply
+// Not the server, and with modification
+rule UnwrapReplyModification:
+  let
+    newResponse = response // the message didn't change
+    // the middlebox changed it from new to resp, but we're working backwards!
+    modificationLog = keyedHash(<'change', hash(newResponse), hash(response)>, k_acc_cm1)
+    inHashChain = < outHashChain, $Current, hash(response), modificationLog >
+  in
+  [
+    CheckReply(pathID, request, response, inHashChain),
+    !ClientSession($C, $M, $S, pathID, k_tls_cm1),
+    !ClientAccountabilityKey($Current, pathID, k_acc_cm1)
+  ]
+--[
+    // Restrictions
+    Bounded('unwrap')
+  ]->
+  [
+    CheckReply(pathID, request, newResponse, outHashChain)
+  ]
+
+// Unwrap a step of the reply
+// The original server message
+rule UnwrapReplyServer:
+  let
+    // the middlebox changed it from new to resp, but we're working backwards!
+    inHashChain = keyedHash(hash(<'original', response>), pathID)
+  in
+  [
+    CheckReply(pathID, request, response, inHashChain),
+    !ClientSession($C, $M, $S, pathID, k_tls_cm1)
+  ]
+--[
+    // Restrictions
+    Bounded('unwrap'),
+    // Check
+    Reachable()
+  ]->
+  [
+  ]
+
 
 // ------------------------- Restrictions --------------------- //
 
@@ -417,15 +484,15 @@ restriction unknown_acc_keys:
 "
   All accKey pathID #tuse. UseAccKeyOnPath(accKey, pathID)@tuse
 ==>
-  ((not Ex #tkk. KU(accKey)@tkk) &
+  (not Ex #tkk. KU(accKey)@tkk) &
   (not Ex #tkp. KU(pathID)@tkp)
-  ) | (
-  Ex M #tcorrupt. CorruptMiddleboxAccKey(M, accKey, pathID)@tcorrupt
-  )
+//  ) | (
+//  Ex M #tcorrupt. CorruptMiddleboxAccKey(M, accKey, pathID)@tcorrupt
+//  )
 "
 
 // --------------------------- Sources --------------------------- //
-
+/*
 restriction receives_encryption:
 "
   All A payload fullMessage #tenc. ReceivesEncryptedUsing(A, payload, fullMessage)@tenc ==>
@@ -436,7 +503,7 @@ restriction receives_encryption:
           & (#tsend < #tenc)
     )
 "
-
+*/
 // ----------------------------- Looping ------------------------- //
 
 lemma PathCreationLoop[use_induction, reuse]:
