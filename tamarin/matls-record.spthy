@@ -377,7 +377,7 @@ rule UnwrapReplyNoModification:
     Bounded('unwrap'),
     // Security
     ObserveMiddleboxOnPath(pathID, $M),
-    ObserveMiddleboxNoModifiesOnPath(pathID)
+    ObserveMiddleboxNoModifiesOnPath(pathID, $M)
   ]->
   [
     CheckReply(pathID, request, newResponse, outHashChain)
@@ -523,8 +523,6 @@ lemma reachable:
   Ex #t. Reachable()@t
 "
 
-end
-
 // ----------------------- Security/Helper ------------------- //
 
 // If an agent is added to a path (and they are not corrupt),
@@ -538,7 +536,7 @@ lemma AlwaysActOnPath:
         RegisterHonestMiddlebox(pathID, M)@tadd &
         StartReplyOnPath(pathID, reply)@tstart &
         ConfirmReplyOnPath(pathID, reply)@tconfirm & // (client can read the reply from the mod.log)
-        (#tadd < #start) &
+        (#tadd < #tstart) &
         (#tstart < #tconfirm)
     ==> // the middlebox either modified the message, or didn't
     (
@@ -594,7 +592,7 @@ lemma DataAuthentication:
 lemma ModificationAccountability:
   all-traces
   "
-  All pathID M reply #tadd #tconfirm #treply.
+  All pathID M reply #tadd #tconfirm #trecv.
       RegisterHonestMiddlebox(pathID, M)@tadd &
       ReceiveReplyOnPath(pathID)@trecv &
       ConfirmReplyOnPath(pathID, reply)@tconfirm
@@ -621,10 +619,10 @@ lemma ModificationAccountability:
 lemma PathIntegrity:
   all-traces
   "
-  All pathID M1 M2 reply #tadd1 #tadd2 #tadjacent #tconfirm #treply.
+  All pathID M1 M2 reply #tadd1 #tadd2 #tadjacent #tconfirm #trecv.
       RegisterHonestMiddlebox(pathID, M1)@tadd1 &
       RegisterHonestMiddlebox(pathID, M2)@tadd2 &
-      RegisterAdjacentMiddleboxes(pathID, M1, M2)@tadjacent
+      RegisterAdjacentMiddleboxes(pathID, M1, M2)@tadjacent &
       ReceiveReplyOnPath(pathID)@trecv &
       ConfirmReplyOnPath(pathID, reply)@tconfirm
   ==>
@@ -638,3 +636,4 @@ lemma PathIntegrity:
       (#tm2 < #tm1)
   )
   "
+end
