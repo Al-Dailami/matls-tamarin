@@ -80,7 +80,10 @@ rule AddMiddlebox:
       // Looping
       LoopStep(pathID),
       // Path Integrity
-      PathOrder($Current, $Next, pathID)
+      PathOrder($Current, $Next, pathID),
+      // Security
+      RegisterHonestMiddlebox(pathID, $Current),
+      RegisterAdjacentMiddleboxes(pathID, $Current, $Next)
     ]->
     [
       !MiddleboxSession(Last, $Current, $Next, pathID, k_acc_cm1, k_acc_m1s, k_tls_last, ~k_tls_next),
@@ -88,7 +91,6 @@ rule AddMiddlebox:
       !ServerAccountabiltyKey($Current, pathID, k_acc_m1s),
       MiddleboxHalfSession($Current, $Next, 'empty', pathID, ~k_acc_cm2, ~k_acc_m2s, ~k_tls_next, 'empty')
     ]
-
 // Add a corrupt middlebox (i.e. the adversary also learns the keys)
 
 rule AddCorruptMiddlebox:
@@ -111,7 +113,9 @@ rule AddCorruptMiddlebox:
       // Looping
       LoopStep(pathID),
       // Path Integrity
-      PathOrder($Current, $Next, pathID)
+      PathOrder($Current, $Next, pathID),
+      // Security
+      RegisterAdjacentMiddleboxes(pathID, $Current, $Next)
     ]->
     [
       !MiddleboxSession(Last, $Current, $Next, pathID, k_acc_cm1, k_acc_m1s, k_tls_last, ~k_tls_next),
@@ -143,6 +147,7 @@ rule EndPath:
       !ServerAccountabiltyKey($Current, pathID, k_acc_m1s),
       !ServerSession($C, $Current, $S, pathID, ~k_tls_next)
     ]
+
 
 // ------------------------- Forward Path Operation -------------------- //
 /* 
@@ -249,7 +254,9 @@ rule ServerReply:
     // Sources
     SentEncryptedUsing($S, outMsg, outSenc),
     // Looping
-    ReplySource(pathID)
+    ReplySource(pathID),
+    // Security
+    StartReplyOnPath(pathID, ~response)
   ]->
   [
     Out(outSenc)
@@ -281,7 +288,10 @@ rule ForwardReply_NoEdit:
     ReceivesEncryptedUsing($M1, inMsg, inSenc),
     SentEncryptedUsing($M1, outMsg, outSenc),
     // Looping
-    ReplyLoop(pathID)
+    ReplyLoop(pathID),
+    // Security
+    MiddleboxTransceives(pathID, $M, response, response),
+    MiddleboxNoModify(pathID, $M)
   ]->
   [
     Out(outSenc)
@@ -314,7 +324,10 @@ rule ForwardReply_Edit:
     ReceivesEncryptedUsing($M1, inMsg, inSenc),
     SentEncryptedUsing($M1, outMsg, outSenc),
     // Looping
-    ReplyLoop(pathID)
+    ReplyLoop(pathID),
+    // Security
+    MiddleboxModifies(pathID, $M, response, ~newResp),
+    MiddleboxTransceives(pathID, $M, response, ~newResp)
   ]->
   [
     Out(outSenc)
@@ -338,13 +351,14 @@ rule ReceiveReply:
     Bounded('resp'),
     RecvUsingKey(k_tls_cm1, pathID),
     // Looping
-    ReplyRecv(pathID)
-    //Reachable()
-    // Sanity lemma,
+    ReplyRecv(pathID),
+    // Security
+    ReceiveReplyOnPath(pathID)
   ]->
   [
     CheckReply(pathID, request, response, inHashChain)
   ]
+
 
 // Unwrap a step of the reply
 // Not the server, and no modification
@@ -360,11 +374,15 @@ rule UnwrapReplyNoModification:
   ]
 --[
     // Restrictions
-    Bounded('unwrap')
+    Bounded('unwrap'),
+    // Security
+    ObserveMiddleboxOnPath(pathID, $M),
+    ObserveMiddleboxNoModifiesOnPath(pathID)
   ]->
   [
     CheckReply(pathID, request, newResponse, outHashChain)
   ]
+
 
 // Unwrap a step of the reply
 // Not the server, and with modification
@@ -382,7 +400,10 @@ rule UnwrapReplyModification:
   ]
 --[
     // Restrictions
-    Bounded('unwrap')
+    Bounded('unwrap'),
+    // Security
+    ObserveMiddleboxOnPath(pathID, $M),
+    ObserveMiddleboxModifiesOnPath(pathID, $M, response, newResponse)
   ]->
   [
     CheckReply(pathID, request, newResponse, outHashChain)
@@ -403,7 +424,9 @@ rule UnwrapReplyServer:
     // Restrictions
     Bounded('unwrap'),
     // Check
-    Reachable()
+    Reachable(),
+    // Security
+    ConfirmReplyOnPath(pathID, response)
   ]->
   [
   ]
@@ -428,16 +451,6 @@ restriction unique_on_path:
   All A pID #t1 #t2. UniqueOnPath(A, pID)@t1 & UniqueOnPath(A, pID)@t2
     ==> (#t1 = #t2)
 "
-
-// We will only send requests down a path once it is established
-/*
-restriction require_established_session:
-"
-  All pID #tsend. RequireEstablishedSession(pID)@tsend
-==>
-  Ex #tfinish. SessionEstablished(pID)@tfinish
-"
-*/
 
 // A middlebox won't wilingly edit the same response twice (i.e. in a replay)
 restriction already_replied:
@@ -491,19 +504,6 @@ restriction unknown_acc_keys:
 //  )
 "
 
-// --------------------------- Sources --------------------------- //
-/*
-restriction receives_encryption:
-"
-  All A payload fullMessage #tenc. ReceivesEncryptedUsing(A, payload, fullMessage)@tenc ==>
-    (Ex #tkv. K(payload)@tkv
-              & (#tkv < #tenc)
-    ) |
-    (Ex B #tsend. SentEncryptedUsing(B, payload, fullMessage)@tsend
-          & (#tsend < #tenc)
-    )
-"
-*/
 // ----------------------------- Looping ------------------------- //
 
 lemma PathCreationLoop[use_induction, reuse]:
@@ -515,30 +515,6 @@ lemma PathCreationLoop[use_induction, reuse]:
 ==>
   Ex #tsource. LoopSource(pID)@tsource)  
 "
-/*
-lemma RequestLoop[use_induction, reuse]:
-"
-  All pID key value #tloop. RequestLoop(pID, key, value)@tloop
-==>
-    (Ex key2 value2 #tsource. RequestSource(pID, key2, value2)@tsource)
-  | (Ex #tkk #tkv. K(value)@tkv & (#tkv < #tloop) &
-                   K(key)@tkk & K(value)@tkv
-    )
-//&   (All pID #tclose. RequestRecv(pID)@tclose
-//==>
-//  Ex #tsource. RequestSource(pID)@tsource)  
-"
-
-lemma ReplyLoop[use_induction, reuse]:
-"
-  (All pID #tloop. ReplyLoop(pID)@tloop
-==>
-  Ex #tsource. ReplySource(pID)@tsource) &
-   (All pID #tclose. ReplyRecv(pID)@tclose
-==>
-  Ex #tsource. ReplySource(pID)@tsource)  
-"
-*/
 // ------------------------- Reachability --------------------- //
 
 lemma reachable:
@@ -548,3 +524,117 @@ lemma reachable:
 "
 
 end
+
+// ----------------------- Security/Helper ------------------- //
+
+// If an agent is added to a path (and they are not corrupt),
+// and the client confirms a response, then that agent acted
+// during the loop.
+// This is a helper lemma: it establishes a bijection for modification integrity
+lemma AlwaysActOnPath:
+  all-traces
+  "
+    All M pathID reply #tadd #tstart #tconfirm.
+        RegisterHonestMiddlebox(pathID, M)@tadd &
+        StartReplyOnPath(pathID, reply)@tstart &
+        ConfirmReplyOnPath(pathID, reply)@tconfirm & // (client can read the reply from the mod.log)
+        (#tadd < #start) &
+        (#tstart < #tconfirm)
+    ==> // the middlebox either modified the message, or didn't
+    (
+      Ex from to #tmod. 
+          MiddleboxModifies(pathID, M, from, to)@tmod &
+          (#tstart < #tmod) &
+          (#tmod < #tconfirm)
+    )|(
+      Ex #tnomod.
+          MiddleboxNoModify(pathID, M)@tnomod &
+          (#tstart < #tnomod) &
+          (#tnomod < #tconfirm)
+    )
+  "
+
+// Another helper for modification/path integrity.
+// The previous lemma states that every (honest) middlebox does indeed act.
+// Now we show the opposite: that the client will always observe an action by
+// each middlebox. This does not guarantee that the middlebox actually acted
+// (only that the client believes that they did)
+lemma AlwaysObserveActions:
+  all-traces
+  "
+    All M pathID reply #tadd #trecv #tconfirm.
+      RegisterHonestMiddlebox(pathID, M)@tadd &
+      ReceiveReplyOnPath(pathID)@trecv &
+      ConfirmReplyOnPath(pathID, reply)@tconfirm
+    ==>
+    Ex #tobserve.
+      ObserveMiddleboxOnPath(pathID, M)@tobserve &
+      (#trecv < #tobserve) &
+      (#tobserve < #tconfirm)
+  "
+
+// ----------------------- Security/Goals ------------------- //
+
+// The client always has an "idea" of what the server initially intended to send
+// Importantly, this means that the server did indeed determine a reply at some point,
+// and it's not the case that one of the middleboxes is secretly behaving as an endpoint
+lemma DataAuthentication:
+  all-traces
+  "
+    All pathID reply #tconfirm.
+        ConfirmReplyOnPath(pathID, reply)@tconfirm
+    ==>
+    Ex #treply. StartReplyOnPath(pathID, reply)@treply
+  "
+
+// The client can detect whether or not an (honest) middlebox has modified a reply in-transit
+// We confirmed in previous lemmas that these middleboxes always act, and that we always
+// observe that an action took place. Now we are confirming that the action is indeed what
+// we thought it was
+lemma ModificationAccountability:
+  all-traces
+  "
+  All pathID M reply #tadd #tconfirm #treply.
+      RegisterHonestMiddlebox(pathID, M)@tadd &
+      ReceiveReplyOnPath(pathID)@trecv &
+      ConfirmReplyOnPath(pathID, reply)@tconfirm
+  ==>
+    ( // Modification
+      All from to #tobs.
+        ObserveMiddleboxModifiesOnPath(pathID, M, from, to)@tobs
+      ==>
+      Ex #tmod.
+        MiddleboxModifies(pathID, M, from, to)@tmod
+    ) & ( // No Modification
+      All #tobs.
+        ObserveMiddleboxNoModifiesOnPath(pathID, M)@tobs
+      ==>
+      Ex #tnomod.
+        MiddleboxNoModify(pathID, M)@tnomod 
+    )
+  "
+
+// The order in which the client added middleboxes is consistent with the
+// order in which the middleboxes actually act.
+// This works in reverse order for replies
+// We only consider adjacent middleboxes, and the full path follows by trivial induction
+lemma PathIntegrity:
+  all-traces
+  "
+  All pathID M1 M2 reply #tadd1 #tadd2 #tadjacent #tconfirm #treply.
+      RegisterHonestMiddlebox(pathID, M1)@tadd1 &
+      RegisterHonestMiddlebox(pathID, M2)@tadd2 &
+      RegisterAdjacentMiddleboxes(pathID, M1, M2)@tadjacent
+      ReceiveReplyOnPath(pathID)@trecv &
+      ConfirmReplyOnPath(pathID, reply)@tconfirm
+  ==>
+  // If M1 touched the message "in", then M2 created the message "in"
+  (
+    All current new #tm1.
+      MiddleboxTransceives(pathID, M1, current, new)@tm1
+    ==>
+    Ex old #tm2.
+      MiddleboxTransceives(pathID, M2, old, current)@tm2 &
+      (#tm2 < #tm1)
+  )
+  "
